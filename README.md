@@ -67,6 +67,20 @@ npm install
 npm run typecheck
 ```
 
+## E2E test (containerized)
+
+Builds a container with pi + the extension + a mock OpenAI-compatible server,
+runs pi headless (`pi -p`), and asserts that (a) the main agent answered and
+(b) the extension fired the turn summary against the model endpoint.
+
+```bash
+./test/e2e.sh
+```
+
+Requires Docker. The test uses `delayMs: 0` (summarize immediately) so the
+summary fires before pi exits, and a shutdown flush for print mode — see
+`test/run-in-container.sh` and `test/mock-server.mjs`.
+
 ## Publish later
 
 This is a `pi-package` (see `package.json` `pi.extensions` field) so it's publishable to npm or the [pi package gallery](https://pi.dev/packages) later. Add `video`/`image` metadata when the time comes.

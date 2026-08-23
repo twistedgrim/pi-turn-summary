@@ -146,11 +146,12 @@ const loadConfig = (cwd: string): TurnSummaryConfig => {
 
 interface SummaryState {
   lastMessageCount: number;
-  timer: ReturnType<typeof setTimeout> | null;
+  timer: ReturnType<typeof setTimeout> | ReturnType<typeof setImmediate> | null;
   inFlight: boolean;
   abort: AbortController | null;
   history: SummaryRecord[];
   maxHistory: number;
+  pendingText: string | undefined;
 }
 
 export default async function (pi: ExtensionAPI) {
@@ -165,6 +166,17 @@ export default async function (pi: ExtensionAPI) {
     abort: null,
     history: [],
     maxHistory: 20,
+    pendingText: undefined,
+  };
+
+  const clearPending = (): void => {
+    if (state.timer) {
+      // Handles may be a Timeout or an Immediate; clearing both is a no-op
+      // for whichever type isn't held.
+      clearTimeout(state.timer as ReturnType<typeof setTimeout>);
+      clearImmediate(state.timer as ReturnType<typeof setImmediate>);
+      state.timer = null;
+    }
   };
 
   const toModel = (id: string, name: string): ProviderModelConfig => ({
@@ -211,6 +223,72 @@ export default async function (pi: ExtensionAPI) {
   } catch {
     registerProvider([toModel(cfg.provider.modelId, "Turn summary model")]);
   }
+  const runSummary = async (ctx: ExtensionContext): Promise<void> => {
+    state.timer = null;
+    if (state.inFlight) return;
+    if (!ctx.isIdle()) return; // a new turn already started
+
+    state.inFlight = true;
+    state.abort = new AbortController();
+    try {
+      const fresh = ctx.sessionManager.getBranch() as SessionEntry[];
+      if (fresh.length <= state.lastMessageCount) return;
+
+      const conversationText = buildConversationText(fresh);
+      if (!conversationText.trim()) return;
+
+      if (ctx.hasUI && cfg.notify) {
+        ctx.ui.notify("Summarizing turn…", "info");
+      }
+
+      const model = ctx.modelRegistry.find(cfg.provider.name, primaryModelId);
+      if (!model) {
+        if (ctx.hasUI) ctx.ui.notify(`turn-summary: model ${cfg.provider.name}/${cfg.provider.modelId} not found`, "warning");
+        return;
+      }
+
+      const response = await ctx.modelRegistry.complete(
+        model,
+        {
+          messages: [
+            {
+              role: "user" as const,
+              content: [{ type: "text" as const, text: buildSummaryPrompt(conversationText) }],
+              timestamp: Date.now(),
+            },
+          ],
+        },
+        { sessionId: randomUUID(), cacheRetention: "none", signal: state.abort?.signal },
+      );
+
+      const summary = response.content
+        .filter((c): c is { type: "text"; text: string } => c.type === "text")
+        .map((c) => c.text)
+        .join("\n")
+        .trim();
+
+      if (summary) {
+        state.history.unshift({
+          sessionId: ctx.sessionManager.getSessionId(),
+          ts: nowIso(),
+          text: summary,
+        });
+        if (state.history.length > state.maxHistory) state.history.length = state.maxHistory;
+        if (ctx.hasUI && cfg.notify) {
+          ctx.ui.notify(summary.split("\n")[0].slice(0, 160), "info");
+        }
+      }
+
+      state.lastMessageCount = fresh.length;
+    } catch (err) {
+      if (!(err instanceof Error && err.name === "AbortError") && ctx.hasUI) {
+        ctx.ui.notify(`turn-summary failed: ${(err as Error).message}`, "warning");
+      }
+    } finally {
+      state.inFlight = false;
+      state.abort = null;
+    }
+  };
 
   pi.on("agent_settled", async (_event: AgentSettledEvent, ctx: ExtensionContext) => {
     if (!cfg.enabled) return;
@@ -224,84 +302,22 @@ export default async function (pi: ExtensionAPI) {
     }
     // Nothing new since the last summary.
     if (state.lastMessageCount >= count) return;
-    if (state.timer) clearTimeout(state.timer);
+    clearPending();
+    state.pendingText = buildConversationText(entries);
 
-    state.timer = setTimeout(async () => {
-      state.timer = null;
-      if (state.inFlight) return;
-      if (!ctx.isIdle()) return; // a new turn already started
-
-      state.inFlight = true;
-      state.abort = new AbortController();
-      try {
-        const fresh = ctx.sessionManager.getBranch() as SessionEntry[];
-        if (fresh.length <= state.lastMessageCount) return;
-
-        const conversationText = buildConversationText(fresh);
-        if (!conversationText.trim()) return;
-
-        if (ctx.hasUI && cfg.notify) {
-          ctx.ui.notify("Summarizing turn…", "info");
-        }
-
-        const model = ctx.modelRegistry.find(cfg.provider.name, primaryModelId);
-        if (!model) {
-          if (ctx.hasUI) ctx.ui.notify(`turn-summary: model ${cfg.provider.name}/${cfg.provider.modelId} not found`, "warning");
-          return;
-        }
-
-        const response = await ctx.modelRegistry.complete(
-          model,
-          {
-            messages: [
-              {
-                role: "user" as const,
-                content: [{ type: "text" as const, text: buildSummaryPrompt(conversationText) }],
-                timestamp: Date.now(),
-              },
-            ],
-          },
-          { sessionId: randomUUID(), cacheRetention: "none", signal: state.abort?.signal },
-        );
-
-        const summary = response.content
-          .filter((c): c is { type: "text"; text: string } => c.type === "text")
-          .map((c) => c.text)
-          .join("\n")
-          .trim();
-
-        if (summary) {
-          state.history.unshift({
-            sessionId: ctx.sessionManager.getSessionId(),
-            ts: nowIso(),
-            text: summary,
-          });
-          if (state.history.length > state.maxHistory) state.history.length = state.maxHistory;
-          if (ctx.hasUI && cfg.notify) {
-            ctx.ui.notify(summary.split("\n")[0].slice(0, 160), "info");
-          }
-        }
-
-        state.lastMessageCount = fresh.length;
-      } catch (err) {
-        if (!(err instanceof Error && err.name === "AbortError") && ctx.hasUI) {
-          ctx.ui.notify(`turn-summary failed: ${(err as Error).message}`, "warning");
-        }
-      } finally {
-        state.inFlight = false;
-        state.abort = null;
-      }
-    }, cfg.delayMs);
+    // delayMs <= 0 summarizes immediately (used by tests/print mode where the
+    // process may exit before a delay elapses).
+    state.timer =
+      cfg.delayMs <= 0
+        ? setImmediate(() => runSummary(ctx))
+        : setTimeout(() => runSummary(ctx), cfg.delayMs);
   });
 
   // A new turn invalidates any pending summary — it would otherwise summarize
   // stale context mid-answer. Aborts an in-flight summary, mirroring how
   // Claude Code's AgentSummary stop() cancels its background fork.
   pi.on("turn_start", async (_event: TurnStartEvent, _ctx: ExtensionContext) => {
-    if (state.timer) {
-      clearTimeout(state.timer);
-      state.timer = null;
-    }
+    clearPending();
     if (state.inFlight && state.abort) state.abort.abort();
   });
 
@@ -318,12 +334,41 @@ export default async function (pi: ExtensionAPI) {
     },
   });
 
-  // Clean up session-scoped resources per the extension guide.
+  // Clean up session-scoped resources per the extension guide. In print mode
+  // the process exits right after the agent settles, so if a summary is still
+  // pending at shutdown, flush it now instead of dropping it.
+  // In print mode pi exits right after the agent settles, so if a summary is
+  // still pending at shutdown, flush it with a raw request: session_shutdown
+  // receives a stale ctx, and pi's model registry is not usable through it.
   pi.on("session_shutdown", async (_event: SessionShutdownEvent) => {
-    if (state.timer) {
-      clearTimeout(state.timer);
-      state.timer = null;
+    clearPending();
+    const text = state.pendingText;
+    state.pendingText = undefined;
+    if (!text || state.inFlight) return;
+    try {
+      const prompt = buildSummaryPrompt(text);
+      const url = `${cfg.provider.baseUrl.replace(/\/$/, "")}/completions`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.provider.apiKey}` },
+        body: JSON.stringify({
+          model: primaryModelId,
+          prompt,
+          max_tokens: cfg.provider.maxTokens,
+          temperature: 0.2,
+          stream: false,
+        }),
+      });
+      if (res.ok) {
+        const payload = (await res.json()) as { choices?: Array<{ text?: string }> };
+        const summary = (payload.choices?.[0]?.text ?? "").trim();
+        if (summary) {
+          state.history.unshift({ sessionId: "", ts: nowIso(), text: summary });
+          if (state.history.length > state.maxHistory) state.history.length = state.maxHistory;
+        }
+      }
+    } catch {
+      // nothing to report into; exit is on its way
     }
-    if (state.inFlight && state.abort) state.abort.abort();
   });
 }
