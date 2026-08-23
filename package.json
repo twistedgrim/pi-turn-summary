@@ -1,0 +1,37 @@
+{
+  "name": "pi-turn-summary",
+  "version": "0.1.0",
+  "description": "Automatically summarize each completed agent turn via a local OpenAI-compatible model",
+  "keywords": ["pi-package", "pi", "pi-extension", "summary", "turn-summary"],
+  "license": "MIT",
+  "author": "James Cobb",
+  "type": "module",
+  "main": "extensions/turn-summary.ts",
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/twistedgrim/pi-turn-summary.git"
+  },
+  "homepage": "https://github.com/twistedgrim/pi-turn-summary",
+  "bugs": {
+    "url": "https://github.com/twistedgrim/pi-turn-summary/issues"
+  },
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
