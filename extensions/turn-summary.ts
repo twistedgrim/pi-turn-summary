@@ -7,7 +7,9 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
+  ProviderModelConfig,
   TurnStartEvent,
+  SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
 
 // ---------------------------------------------------------------------------
@@ -18,6 +20,10 @@ import type {
 // turn), using a locally running OpenAI-compatible model. Fires one quiet TUI
 // notification and keeps the last few summaries in memory (ephemeral —
 // nothing is written to disk). Use `/turn-summary` to replay the latest one.
+//
+// Follows the pi extension guide: async factory discovers and registers local
+// models at startup (visible to `pi --list-models`); timers are only created
+// inside event handlers and cleaned up on session_shutdown.
 //
 // Configuration lives in `turn-summary.json` next to the project or in
 // `~/.pi/agent/turn-summary.json`. See README.md.
@@ -147,7 +153,11 @@ interface SummaryState {
   maxHistory: number;
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
+  // Config is loaded once at startup. No ctx in the factory, so use cwd.
+  const cfg = loadConfig(process.cwd());
+  let primaryModelId = cfg.provider.modelId;
+
   const state: SummaryState = {
     lastMessageCount: -1,
     timer: null,
@@ -156,44 +166,54 @@ export default function (pi: ExtensionAPI) {
     history: [],
     maxHistory: 20,
   };
-  let loadedConfig: TurnSummaryConfig | null = null;
-  let providerRegistered = false;
 
-  const getConfig = (ctx: ExtensionContext): TurnSummaryConfig => {
-    if (!loadedConfig) loadedConfig = loadConfig(ctx.cwd);
-    return loadedConfig;
-  };
+  const toModel = (id: string, name: string): ProviderModelConfig => ({
+    id,
+    name,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: cfg.provider.contextWindow,
+    maxTokens: cfg.provider.maxTokens,
+  });
 
-  // Register the self-contained OpenAI-compatible provider from the loaded
-  // config (defaults apply when no config file exists). Registers lazily so
-  // config overrides are honored; takes effect immediately after the initial
-  // load phase per the extension docs.
-  const ensureProvider = (cfg: TurnSummaryConfig): void => {
-    if (providerRegistered) return;
+  const registerProvider = (models: ProviderModelConfig[]): void => {
     pi.registerProvider(cfg.provider.name, {
       name: "Pi Turn Summary (local)",
       baseUrl: cfg.provider.baseUrl,
       apiKey: cfg.provider.apiKey,
       api: cfg.provider.api,
-      models: [
-        {
-          id: cfg.provider.modelId,
-          name: "Turn summary model",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: cfg.provider.contextWindow,
-          maxTokens: cfg.provider.maxTokens,
-        },
-      ],
+      models,
     });
-    providerRegistered = true;
   };
 
+  // Guide pattern: discover the local server's models at startup so the
+  // provider is available immediately and shows up in `pi --list-models`.
+  // Falls back to the configured single model when the server is unreachable.
+  try {
+    const res = await fetch(`${cfg.provider.baseUrl}/models`, {
+      signal: AbortSignal.timeout(3000),
+    });
+    if (res.ok) {
+      const payload = (await res.json()) as { data?: Array<{ id?: string }> };
+      const ids = (payload.data ?? [])
+        .map((m) => m.id)
+        .filter((id): id is string => !!id);
+      if (ids.length > 0) {
+        primaryModelId = ids.includes(cfg.provider.modelId) ? cfg.provider.modelId : ids[0];
+        registerProvider(ids.map((id) => toModel(id, id)));
+      } else {
+        registerProvider([toModel(cfg.provider.modelId, "Turn summary model")]);
+      }
+    } else {
+      registerProvider([toModel(cfg.provider.modelId, "Turn summary model")]);
+    }
+  } catch {
+    registerProvider([toModel(cfg.provider.modelId, "Turn summary model")]);
+  }
+
   pi.on("agent_settled", async (_event: AgentSettledEvent, ctx: ExtensionContext) => {
-    const cfg = getConfig(ctx);
     if (!cfg.enabled) return;
-    ensureProvider(cfg);
 
     const entries = ctx.sessionManager.getBranch() as SessionEntry[];
     const count = entries.length;
@@ -224,7 +244,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Summarizing turn…", "info");
         }
 
-        const model = ctx.modelRegistry.find(cfg.provider.name, cfg.provider.modelId);
+        const model = ctx.modelRegistry.find(cfg.provider.name, primaryModelId);
         if (!model) {
           if (ctx.hasUI) ctx.ui.notify(`turn-summary: model ${cfg.provider.name}/${cfg.provider.modelId} not found`, "warning");
           return;
@@ -296,5 +316,14 @@ export default function (pi: ExtensionAPI) {
       }
       if (ctx.hasUI) ctx.ui.notify(latest.text, "info");
     },
+  });
+
+  // Clean up session-scoped resources per the extension guide.
+  pi.on("session_shutdown", async (_event: SessionShutdownEvent) => {
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    if (state.inFlight && state.abort) state.abort.abort();
   });
 }

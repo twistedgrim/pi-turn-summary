@@ -29,7 +29,7 @@ or symlink it into the auto-discovered global extension directory:
 ln -s ~/Github/pi-turn-summary/extensions/turn-summary.ts ~/.pi/agent/extensions/turn-summary.ts
 ```
 
-Restart pi or run `/reload` — the extension registers its own local provider at first use.
+Restart pi or run `/reload` — on startup the extension discovers your local server's models and registers its own OpenAI-compatible provider (visible in `pi --list-models`); if the server is unreachable it falls back to the configured single model.
 
 ## Configuration
 
