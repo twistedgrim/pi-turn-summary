@@ -44,10 +44,10 @@ interface TurnSummaryConfig {
   delayMs: number;
   minMessages: number;
   notify: boolean;
-  /** Existing pi provider to use for summaries (e.g. "lmstudio", "litellm"). */
-  providerName: string;
-  /** Model id within that provider (e.g. "gemma-4-12b-it-mlx"). */
-  modelId: string;
+  /** Existing pi provider to use for summaries. Omit to use the current model's provider. */
+  providerName?: string;
+  /** Model id within that provider. Omit to use the current model's id. */
+  modelId?: string;
   /** Optional: override endpoint for the shutdown-flush path (raw fetch). */
   baseUrl?: string;
   apiKey?: string;
@@ -58,8 +58,6 @@ const DEFAULT_CONFIG: TurnSummaryConfig = {
   delayMs: 10_000,
   minMessages: 2,
   notify: true,
-  providerName: "lmstudio",
-  modelId: "gemma-4-12b-it-mlx",
 };
 
 const expandHome = (p: string): string => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -154,6 +152,24 @@ interface SummaryState {
 export default async function (pi: ExtensionAPI) {
   const cfg = loadConfig(process.cwd());
 
+  // Lazily resolved from the current model on first summary.
+  let resolvedProvider: string | undefined;
+  let resolvedModelId: string | undefined;
+
+  const resolveModel = (ctx: ExtensionContext): { provider: string; modelId: string } | undefined => {
+    if (cfg.providerName && cfg.modelId) {
+      return { provider: cfg.providerName, modelId: cfg.modelId };
+    }
+    if (resolvedProvider && resolvedModelId) {
+      return { provider: resolvedProvider, modelId: resolvedModelId };
+    }
+    const current = ctx.model;
+    if (!current) return undefined;
+    resolvedProvider = cfg.providerName ?? current.provider;
+    resolvedModelId = cfg.modelId ?? current.id;
+    return { provider: resolvedProvider, modelId: resolvedModelId };
+  };
+
   const state: SummaryState = {
     lastMessageCount: -1,
     timer: null,
@@ -189,9 +205,14 @@ export default async function (pi: ExtensionAPI) {
         ctx.ui.notify("Summarizing turn…", "info");
       }
 
-      const model = ctx.modelRegistry.find(cfg.providerName, cfg.modelId);
+      const resolved = resolveModel(ctx);
+      if (!resolved) {
+        if (ctx.hasUI) ctx.ui.notify("turn-summary: no active model to summarize with", "warning");
+        return;
+      }
+      const model = ctx.modelRegistry.find(resolved.provider, resolved.modelId);
       if (!model) {
-        if (ctx.hasUI) ctx.ui.notify(`turn-summary: model ${cfg.providerName}/${cfg.modelId} not found`, "warning");
+        if (ctx.hasUI) ctx.ui.notify(`turn-summary: model ${resolved.provider}/${resolved.modelId} not found`, "warning");
         return;
       }
 
@@ -297,7 +318,7 @@ export default async function (pi: ExtensionAPI) {
     try {
       // Shutdown-flush requires a raw fetch (ctx.modelRegistry is stale).
       // Needs baseUrl + apiKey in config; silently skip if not provided.
-      if (!cfg.baseUrl) return;
+      if (!cfg.baseUrl || !resolvedModelId) return;
       const prompt = buildSummaryPrompt(text);
       const url = `${cfg.baseUrl.replace(/\/$/, "")}/completions`;
       const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -306,7 +327,7 @@ export default async function (pi: ExtensionAPI) {
         method: "POST",
         headers,
         body: JSON.stringify({
-          model: cfg.modelId,
+          model: resolvedModelId,
           prompt,
           max_tokens: 4096,
           temperature: 0.2,

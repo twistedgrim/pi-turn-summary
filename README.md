@@ -41,18 +41,20 @@ Defaults work out of the box against LM Studio at `http://localhost:1234/v1` (Op
   "delayMs": 10000,
   "minMessages": 2,
   "notify": true,
-  "providerName": "lmstudio",
-  "modelId": "gemma-4-12b-it-mlx",
+  "providerName": "litellm",
+  "modelId": "lmstudio-qwen3-8b",
   "baseUrl": "http://localhost:1234/v1",
   "apiKey": "lm-studio"
 }
 ```
 
+If `providerName` and `modelId` are omitted, the extension uses whatever model is currently active in pi.
+
 - `delayMs` — ms to wait after `agent_settled` before summarizing.
 - `minMessages` — skip tiny conversations.
 - `notify` — quiet `info`-level TUI notification with the one-line summary; set `false` to suppress.
-- `providerName` — existing pi provider to use (default `lmstudio`; also try `litellm`, `crof`, etc.).
-- `modelId` — model id within that provider.
+- `providerName` — existing pi provider to use. Omit to use the current model's provider.
+- `modelId` — model id within that provider. Omit to use the current model's id.
 - `baseUrl` / `apiKey` — optional; only needed for the shutdown-flush path (print mode). If omitted, shutdown summaries are silently skipped.
 
 Summaries are ephemeral (memory only, last ~20 per session, `/turn-summary` to replay). Config is read once at first turn; restart or `/reload` after changing it.
