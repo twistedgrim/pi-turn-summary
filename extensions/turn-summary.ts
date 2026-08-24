@@ -268,14 +268,15 @@ export default async function (pi: ExtensionAPI) {
         .trim();
 
       if (summary) {
+        const prefixed = `\u2192 ${summary}`;
         state.history.unshift({
           sessionId: ctx.sessionManager.getSessionId(),
           ts: nowIso(),
-          text: summary,
+          text: prefixed,
         });
         if (state.history.length > state.maxHistory) state.history.length = state.maxHistory;
         if (ctx.hasUI && cfg.notify) {
-          ctx.ui.notify(summary.split("\n")[0].slice(0, 160), "info");
+          ctx.ui.notify(prefixed.split("\n")[0].slice(0, 160), "info");
         }
       }
 
@@ -363,7 +364,8 @@ export default async function (pi: ExtensionAPI) {
         const payload = (await res.json()) as { choices?: Array<{ text?: string }> };
         const summary = (payload.choices?.[0]?.text ?? "").trim();
         if (summary) {
-          state.history.unshift({ sessionId: "", ts: nowIso(), text: summary });
+          const prefixed = `\u2192 ${summary}`;
+          state.history.unshift({ sessionId: "", ts: nowIso(), text: prefixed });
           if (state.history.length > state.maxHistory) state.history.length = state.maxHistory;
         }
       }
