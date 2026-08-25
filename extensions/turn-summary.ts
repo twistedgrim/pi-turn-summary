@@ -7,7 +7,6 @@ import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
-  ProviderModelConfig,
   TurnStartEvent,
   SessionShutdownEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -21,9 +20,10 @@ import type {
 // notification and keeps the last few summaries in memory (ephemeral —
 // nothing is written to disk). Use `/turn-summary` to replay the latest one.
 //
-// Follows the pi extension guide: async factory discovers and registers local
-// models at startup (visible to `pi --list-models`); timers are only created
-// inside event handlers and cleaned up on session_shutdown.
+// Uses an existing pi provider (default: lmstudio) — no custom provider
+// registration needed. Override via providerName/modelId in config.
+// Timers are only created inside event handlers and cleaned up on
+// session_shutdown.
 //
 // Configuration lives in `turn-summary.json` next to the project or in
 // `~/.pi/agent/turn-summary.json`. See README.md.
@@ -44,15 +44,13 @@ interface TurnSummaryConfig {
   delayMs: number;
   minMessages: number;
   notify: boolean;
-  provider: {
-    name: string;
-    baseUrl: string;
-    apiKey: string;
-    api: string;
-    modelId: string;
-    contextWindow: number;
-    maxTokens: number;
-  };
+  /** Existing pi provider to use for summaries. Omit to use the current model's provider. */
+  providerName?: string;
+  /** Model id within that provider. Omit to use the current model's id. */
+  modelId?: string;
+  /** Optional: override endpoint for the shutdown-flush path (raw fetch). */
+  baseUrl?: string;
+  apiKey?: string;
 }
 
 const DEFAULT_CONFIG: TurnSummaryConfig = {
@@ -60,15 +58,6 @@ const DEFAULT_CONFIG: TurnSummaryConfig = {
   delayMs: 10_000,
   minMessages: 2,
   notify: true,
-  provider: {
-    name: "turn-summary-local",
-    baseUrl: "http://localhost:1234/v1",
-    apiKey: "lm-studio",
-    api: "openai-completions",
-    modelId: "gemma-4-12b-it-mlx",
-    contextWindow: 131072,
-    maxTokens: 4096,
-  },
 };
 
 const expandHome = (p: string): string => (p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
@@ -132,10 +121,16 @@ const loadConfig = (cwd: string): TurnSummaryConfig => {
   for (const p of candidates) {
     try {
       const parsed = JSON.parse(readFileSync(p, "utf-8")) as Partial<TurnSummaryConfig>;
+      // Backward compat: accept old "provider.name" / "provider.modelId" shape
+      const oldProvider = (parsed as Record<string, unknown>).provider as
+        { name?: string; modelId?: string; baseUrl?: string; apiKey?: string } | undefined;
       return {
         ...DEFAULT_CONFIG,
         ...parsed,
-        provider: { ...DEFAULT_CONFIG.provider, ...(parsed.provider ?? {}) },
+        providerName: parsed.providerName ?? oldProvider?.name ?? DEFAULT_CONFIG.providerName,
+        modelId: parsed.modelId ?? oldProvider?.modelId ?? DEFAULT_CONFIG.modelId,
+        baseUrl: parsed.baseUrl ?? oldProvider?.baseUrl,
+        apiKey: parsed.apiKey ?? oldProvider?.apiKey,
       };
     } catch {
       // try the next candidate, then fall back to defaults
@@ -155,9 +150,25 @@ interface SummaryState {
 }
 
 export default async function (pi: ExtensionAPI) {
-  // Config is loaded once at startup. No ctx in the factory, so use cwd.
   const cfg = loadConfig(process.cwd());
-  let primaryModelId = cfg.provider.modelId;
+
+  // Lazily resolved from the current model on first summary.
+  let resolvedProvider: string | undefined;
+  let resolvedModelId: string | undefined;
+
+  const resolveModel = (ctx: ExtensionContext): { provider: string; modelId: string } | undefined => {
+    if (cfg.providerName && cfg.modelId) {
+      return { provider: cfg.providerName, modelId: cfg.modelId };
+    }
+    if (resolvedProvider && resolvedModelId) {
+      return { provider: resolvedProvider, modelId: resolvedModelId };
+    }
+    const current = ctx.model;
+    if (!current) return undefined;
+    resolvedProvider = cfg.providerName ?? current.provider;
+    resolvedModelId = cfg.modelId ?? current.id;
+    return { provider: resolvedProvider, modelId: resolvedModelId };
+  };
 
   const state: SummaryState = {
     lastMessageCount: -1,
@@ -171,58 +182,11 @@ export default async function (pi: ExtensionAPI) {
 
   const clearPending = (): void => {
     if (state.timer) {
-      // Handles may be a Timeout or an Immediate; clearing both is a no-op
-      // for whichever type isn't held.
       clearTimeout(state.timer as ReturnType<typeof setTimeout>);
       clearImmediate(state.timer as ReturnType<typeof setImmediate>);
       state.timer = null;
     }
   };
-
-  const toModel = (id: string, name: string): ProviderModelConfig => ({
-    id,
-    name,
-    reasoning: false,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: cfg.provider.contextWindow,
-    maxTokens: cfg.provider.maxTokens,
-  });
-
-  const registerProvider = (models: ProviderModelConfig[]): void => {
-    pi.registerProvider(cfg.provider.name, {
-      name: "Pi Turn Summary (local)",
-      baseUrl: cfg.provider.baseUrl,
-      apiKey: cfg.provider.apiKey,
-      api: cfg.provider.api,
-      models,
-    });
-  };
-
-  // Guide pattern: discover the local server's models at startup so the
-  // provider is available immediately and shows up in `pi --list-models`.
-  // Falls back to the configured single model when the server is unreachable.
-  try {
-    const res = await fetch(`${cfg.provider.baseUrl}/models`, {
-      signal: AbortSignal.timeout(3000),
-    });
-    if (res.ok) {
-      const payload = (await res.json()) as { data?: Array<{ id?: string }> };
-      const ids = (payload.data ?? [])
-        .map((m) => m.id)
-        .filter((id): id is string => !!id);
-      if (ids.length > 0) {
-        primaryModelId = ids.includes(cfg.provider.modelId) ? cfg.provider.modelId : ids[0];
-        registerProvider(ids.map((id) => toModel(id, id)));
-      } else {
-        registerProvider([toModel(cfg.provider.modelId, "Turn summary model")]);
-      }
-    } else {
-      registerProvider([toModel(cfg.provider.modelId, "Turn summary model")]);
-    }
-  } catch {
-    registerProvider([toModel(cfg.provider.modelId, "Turn summary model")]);
-  }
   const runSummary = async (ctx: ExtensionContext): Promise<void> => {
     state.timer = null;
     if (state.inFlight) return;
@@ -241,9 +205,14 @@ export default async function (pi: ExtensionAPI) {
         ctx.ui.notify("Summarizing turn…", "info");
       }
 
-      const model = ctx.modelRegistry.find(cfg.provider.name, primaryModelId);
+      const resolved = resolveModel(ctx);
+      if (!resolved) {
+        if (ctx.hasUI) ctx.ui.notify("turn-summary: no active model to summarize with", "warning");
+        return;
+      }
+      const model = ctx.modelRegistry.find(resolved.provider, resolved.modelId);
       if (!model) {
-        if (ctx.hasUI) ctx.ui.notify(`turn-summary: model ${cfg.provider.name}/${cfg.provider.modelId} not found`, "warning");
+        if (ctx.hasUI) ctx.ui.notify(`turn-summary: model ${resolved.provider}/${resolved.modelId} not found`, "warning");
         return;
       }
 
@@ -347,15 +316,20 @@ export default async function (pi: ExtensionAPI) {
     state.pendingText = undefined;
     if (!text || state.inFlight) return;
     try {
+      // Shutdown-flush requires a raw fetch (ctx.modelRegistry is stale).
+      // Needs baseUrl + apiKey in config; silently skip if not provided.
+      if (!cfg.baseUrl || !resolvedModelId) return;
       const prompt = buildSummaryPrompt(text);
-      const url = `${cfg.provider.baseUrl.replace(/\/$/, "")}/completions`;
+      const url = `${cfg.baseUrl.replace(/\/$/, "")}/completions`;
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (cfg.apiKey) headers.Authorization = `Bearer ${cfg.apiKey}`;
       const res = await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.provider.apiKey}` },
+        headers,
         body: JSON.stringify({
-          model: primaryModelId,
+          model: resolvedModelId,
           prompt,
-          max_tokens: cfg.provider.maxTokens,
+          max_tokens: 4096,
           temperature: 0.2,
           stream: false,
         }),
